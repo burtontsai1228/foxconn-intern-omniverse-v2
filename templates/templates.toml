@@ -1,0 +1,11 @@
+[templates.kit-core-templates]
+class = "LocalTemplateCollection"
+name = "Kit Core Templates"
+url = "file://${root}/_repo/deps/kit_core_templates/core_templates.toml"
+version = ""
+
+[templates.kit-sample-templates]
+class = "LocalTemplateCollection"
+name = "Kit Sample Templates"
+url = "file://${root}/_repo/deps/kit_sample_templates/sample_templates.toml"
+version = ""
