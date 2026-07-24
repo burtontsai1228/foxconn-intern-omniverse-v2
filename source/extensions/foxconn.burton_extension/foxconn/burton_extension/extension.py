@@ -1,19 +1,26 @@
 import json
 import math
 import omni.ext
+import omni.ui as ui
 import omni.usd
 import omni.kit.app
 from pxr import UsdGeom, Gf
 from kafka import KafkaConsumer
 
 BROKER = "localhost:9092"
-TOPIC = "robot_pose"
+JOINT_TOPIC = "robot_states"
+POSE_TOPIC = "robot_pose"
 
 INVERT = {
     "left_3",
     "right_3",
     "head_pitch",
 }
+
+REF_X = 5.0
+REF_Y = 3.0
+REF_YAW = 1.57
+
 
 class MapAligner:
     def __init__(self):
@@ -34,14 +41,28 @@ class MapAligner:
         yaw = map_theta + self.alpha
         return X, Y, yaw
 
+    def reset(self):
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.alpha = 0.0
+
+    def describe(self):
+        return (f"alpha={math.degrees(self.alpha):.1f}deg "
+                f"offset=({self.offset_x:.3f}, {self.offset_y:.3f})")
+
+
 class MyExtension(omni.ext.IExt):
     def on_startup(self, _ext_id):
-        self._consumer = None
+        self._joint_consumer = None
+        self._pose_consumer = None
         self._sub = None
+        self._window = None
         self._rot_ops = {}
-        self._base_op = None
+        self._base_translate = None
+        self._base_rotate = None
         self._jack_op = None
-        # self._map_aligner = MapAligner()
+        self._aligner = MapAligner()
+        self._latest_pose = None
 
         stage = omni.usd.get_context().get_stage()
         if stage is None:
@@ -56,8 +77,9 @@ class MyExtension(omni.ext.IExt):
             ops = UsdGeom.Xformable(prim).GetOrderedXformOps()
 
             if name == "base_link_J":
-                self._base_op = ops[2]
-                print(f"[burton.spawn] base_link  -> {ops[2].GetOpName()} (Vec3)")
+                self._base_translate = ops[0]
+                self._base_rotate = ops[2]
+                print("[burton.spawn] base_link  -> translate[0] + rotateXYZ[2]")
                 continue
 
             if name == "jack_link_J":
@@ -80,13 +102,21 @@ class MyExtension(omni.ext.IExt):
 
         print(f"[burton.spawn] cached {len(self._rot_ops)} rotation joints + base + jack")
 
-        self._consumer = KafkaConsumer(
-            TOPIC,
+        self._joint_consumer = KafkaConsumer(
+            JOINT_TOPIC,
             bootstrap_servers=BROKER,
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
             auto_offset_reset="latest",
         )
-        print(f"[burton.spawn] connected to {BROKER}, topic '{TOPIC}'")
+        print(f"[burton.spawn] connected to {BROKER}, topic '{JOINT_TOPIC}'")
+
+        self._pose_consumer = KafkaConsumer(
+            POSE_TOPIC,
+            bootstrap_servers=BROKER,
+            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+            auto_offset_reset="latest",
+        )
+        print(f"[burton.spawn] connected to {BROKER}, topic '{POSE_TOPIC}'")
 
         self._sub = (
             omni.kit.app.get_app()
@@ -94,11 +124,35 @@ class MyExtension(omni.ext.IExt):
             .create_subscription_to_pop(self._on_update, name="burton.spawn kafka")
         )
 
+        self._window = ui.Window("Fiibot Calibration", width=320, height=140)
+        with self._window.frame:
+            with ui.VStack(spacing=6):
+                ui.Label("Drive robot to reference point, then:")
+                ui.Button("Calibrate Here", clicked_fn=self._calibrate_here)
+                ui.Button("Reset", clicked_fn=self._reset)
+
+    def _calibrate_here(self):
+        if self._latest_pose is None:
+            print("[burton.spawn] no pose received yet")
+            return
+        mx, my, mth = self._latest_pose
+        self._aligner.calibrate(mx, my, mth, REF_X, REF_Y, REF_YAW)
+        print(f"[burton.spawn] calibrated at map({mx:.2f}, {my:.2f}, {mth:.2f})")
+        print(f"[burton.spawn]   {self._aligner.describe()}")
+
+    def _reset(self):
+        self._aligner.reset()
+        print("[burton.spawn] calibration reset")
+
     def _on_update(self, _e):
-        if not self._consumer:
+        self._update_joints()
+        self._update_pose()
+
+    def _update_joints(self):
+        if not self._joint_consumer:
             return
 
-        records = self._consumer.poll(timeout_ms=0)
+        records = self._joint_consumer.poll(timeout_ms=0)
         if not records:
             return
 
@@ -129,10 +183,41 @@ class MyExtension(omni.ext.IExt):
                     deg = -deg
                 op.Set(deg)
 
+    def _update_pose(self):
+        if not self._pose_consumer or self._base_translate is None:
+            return
+
+        records = self._pose_consumer.poll(timeout_ms=0)
+        if not records:
+            return
+
+        latest = None
+        for _tp, msgs in records.items():
+            if msgs:
+                latest = msgs[-1].value
+        if not latest:
+            return
+
+        x = latest.get("x")
+        y = latest.get("y")
+        theta = latest.get("theta")
+        if x is None or y is None or theta is None:
+            return
+
+        self._latest_pose = (float(x), float(y), float(theta))
+
+        X, Y, yaw = self._aligner.to_scene(float(x), float(y), float(theta))
+        self._base_translate.Set(Gf.Vec3d(X, Y, 0))
+        self._base_rotate.Set(Gf.Vec3d(0, 0, math.degrees(yaw)))
+
     def on_shutdown(self):
         if self._sub:
             self._sub.unsubscribe()
             self._sub = None
-        if self._consumer:
-            self._consumer.close()
-            self._consumer = None
+        if self._joint_consumer:
+            self._joint_consumer.close()
+            self._joint_consumer = None
+        if self._pose_consumer:
+            self._pose_consumer.close()
+            self._pose_consumer = None
+        self._window = None
