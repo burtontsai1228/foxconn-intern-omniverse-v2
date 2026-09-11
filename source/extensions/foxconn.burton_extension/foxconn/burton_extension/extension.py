@@ -14,21 +14,33 @@ KAFKA_TOPIC = "robot_states"
 ROBOT_MAP = {
     "W1000000001": "/World/fiibot_w1_v2_260320",
     "W1000000002": "/World/fiibot_w1_v2_260321",
+    "W1000000003": "/World/fiibot_w1_v2_260322",
+    "W1000000004": "/World/fiibot_w1_v2_260323",
 }
 
 INVERT = {
     "left_3",
     "right_3",
     "head_pitch",
+    "waist"
 }
+
+AUTO_CALIBRATE_ON_FIRST_POSE = True
 
 GRIP_AXIS = 0
 GRIP_MIN = 0.0
 GRIP_MAX = 0.05
 
+GRIP_INVERT = {
+    "left_hand_grip2",
+    "right_hand_grip2",
+}
+
 REF_POINTS = {
     "W1000000001": {"x": 129.4, "y": 41.0, "yaw": 1.57},
     "W1000000002": {"x": 125.0, "y": 41.0, "yaw": 1.57},
+    "W1000000003": {"x": 200.8, "y": 44.86260316679707, "yaw": 1.57},
+    "W1000000004": {"x": 200.8, "y": 47.176107307846245, "yaw": -1.57},
 }
 
 
@@ -62,7 +74,6 @@ class MapAligner:
 
 
 class RobotDriver:
-
     def __init__(self, stage, robot_id, root_path):
         self.robot_id = robot_id
         self.root = root_path
@@ -74,7 +85,8 @@ class RobotDriver:
         self._base_rotate = None
         self._jack_op = None
         self._aligner = MapAligner()
-        self._earliest_pose = None
+        self._latest_pose = None
+        self._auto_calibrated = False
 
         self._cache_nodes(stage)
 
@@ -122,10 +134,10 @@ class RobotDriver:
               f"base={'Y' if self._base_rotate else 'N'}, jack={'Y' if self._jack_op else 'N'}")
 
     def calibrate_here(self):
-        if self._earliest_pose is None:
+        if self._latest_pose is None:
             print(f"[fiibot {self.robot_id}] no pose yet — cannot calibrate")
             return False
-        mx, my, mth = self._earliest_pose
+        mx, my, mth = self._latest_pose
         self._aligner.calibrate(mx, my, mth, self.ref["x"], self.ref["y"], self.ref["yaw"])
         print(f"[fiibot {self.robot_id}] calibrated at ref "
               f"({self.ref['x']}, {self.ref['y']}, {self.ref['yaw']})  {self._aligner.describe()}")
@@ -133,6 +145,7 @@ class RobotDriver:
 
     def reset_calibration(self):
         self._aligner.reset()
+        self._auto_calibrated = False
         print(f"[fiibot {self.robot_id}] calibration reset")
 
     def apply(self, payload):
@@ -175,6 +188,8 @@ class RobotDriver:
             if not op:
                 continue
             d = max(GRIP_MIN, min(GRIP_MAX, float(pos)))
+            if key in GRIP_INVERT:
+                d = -d
             vec = [0.0, 0.0, 0.0]
             vec[GRIP_AXIS] = d
             op.Set(Gf.Vec3d(*vec))
@@ -183,7 +198,15 @@ class RobotDriver:
         if self._base_translate is None or x is None:
             return
         x, y, theta = float(x), float(y), float(theta)
-        self._earliest_pose = (x, y, theta)
+        self._latest_pose = (x, y, theta)
+
+        if AUTO_CALIBRATE_ON_FIRST_POSE and not self._auto_calibrated:
+            self._aligner.calibrate(x, y, theta,
+                                    self.ref["x"], self.ref["y"], self.ref["yaw"])
+            self._auto_calibrated = True
+            print(f"[fiibot {self.robot_id}] auto-calibrated on first pose  "
+                  f"{self._aligner.describe()}")
+
         X, Y, yaw = self._aligner.to_scene(x, y, theta)
         self._base_translate.Set(Gf.Vec3d(X, Y, 0))
         if self._base_rotate:
@@ -192,6 +215,7 @@ class RobotDriver:
 
 class MyExtension(omni.ext.IExt):
     def on_startup(self, _ext_id):
+        print("[fiibot] >>> VERSION stable-2 (4 robots) <<<")
         self._consumer = None
         self._sub = None
         self._window = None
@@ -209,7 +233,8 @@ class MyExtension(omni.ext.IExt):
             KAFKA_TOPIC,
             bootstrap_servers=BROKER,
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-            auto_offset_reset="earliest",
+            auto_offset_reset="latest",
+            consumer_timeout_ms=0,
         )
         print(f"[fiibot] subscribed to '{KAFKA_TOPIC}', robots: {list(self.drivers)}")
 
@@ -220,7 +245,7 @@ class MyExtension(omni.ext.IExt):
         self._window = ui.Window("Fiibot Calibration", width=340, height=140)
         with self._window.frame:
             with ui.VStack(spacing=8):
-                ui.Label("Drive BOTH robots to their reference points, then:")
+                ui.Label("Drive all robots to their reference points, then:")
                 self._status = ui.Label("", word_wrap=True)
                 with ui.HStack(spacing=6, height=30):
                     ui.Button("Calibrate All", clicked_fn=self._calibrate_all)
@@ -245,14 +270,14 @@ class MyExtension(omni.ext.IExt):
         if not records:
             return
 
-        earliest = {}
+        latest = {}
         for _tp, msgs in records.items():
             for m in msgs:
                 data = m.value
                 for robot_id, payload in data.items():
-                    earliest[robot_id] = payload
+                    latest[robot_id] = payload
 
-        for robot_id, payload in earliest.items():
+        for robot_id, payload in latest.items():
             driver = self.drivers.get(robot_id)
             if driver:
                 driver.apply(payload)
